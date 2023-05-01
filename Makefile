@@ -10,7 +10,12 @@ ifeq ($(KERNELRELEASE),)
     # You should set KERNELDIR in the environment if it's elsewhere
     KERNELDIR ?= ~/WSL2-Linux-Kernel/
     # The current directory is passed to sub-makes as argument
-    PWD := $(shell pwd)
+    # However, a link is made to actual directory in user's home
+    # directory to deal with a case where module folder path
+    # conatins whitespaces.
+    PWD := ~/openFC-CM4-LKM
+    ACTPWD := $(shell pwd)
+    MKLNK := $(shell ln -s -T "$(ACTPWD)/" $(PWD))
 
 modules:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
