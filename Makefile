@@ -8,7 +8,7 @@ ifeq ($(KERNELRELEASE),)
 
     # Assume the source tree is where the running kernel was built
     # You should set KERNELDIR in the environment if it's elsewhere
-    KERNELDIR ?= ../WSL2-Linux-Kernel/
+    KERNELDIR ?= ~/WSL2-Linux-Kernel/
     # The current directory is passed to sub-makes as argument
     PWD := $(shell pwd)
 
@@ -25,5 +25,5 @@ clean:
 
 else
     # called from kernel build system: just declare what our modules are
-    obj-m := hello.o
+    obj-m := usbDriver.o
 endif

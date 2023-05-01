@@ -1,14 +1,12 @@
 /**
-* @file hello.c
-* @author Akshat Sinha
-* @date 10 Sept 2016
-* @version 0.1
-* @brief An introductory "Hello World!" loadable kernel
-* module (LKM) that can display a message in the /var/log/kern.log
-* file when the module is loaded and removed. The module can accept
-* an argument when it is loaded -- the name, which appears in the
-* kernel log files.
-*/
+ * @file openFC-CM4-USB-Driver.c
+ * @author Vatsal Joshi
+ * @date 01 May 2023
+ * @version 0.1
+ * @brief A driver to read sensor data and send commands to
+ * an rp2040 based PI CM4 board which is used as flight controller
+ * and the PI CM4 is used as the main processing unit.
+ */
 #include <linux/module.h>	 /* Needed by all modules */
 #include <linux/kernel.h>	 /* Needed for KERN_INFO */
 #include <linux/init.h>	 /* Needed for the macros */
@@ -34,7 +32,7 @@ static int __init hello_init(void)
 
 static void __exit hello_exit(void)
 {
-	printk(KERN_INFO "Goodbye Mr.\n");
+	printk(KERN_INFO "Goodbye!\n");
 }
 
 module_init(hello_init);
