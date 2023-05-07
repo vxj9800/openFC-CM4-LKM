@@ -1,0 +1,28 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/vatsal/WSL2-Linux-Kernel/include/**",
+                "/home/vatsal/WSL2-Linux-Kernel/arch/x86/include/**"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "compilerArgs": [
+                "-nostdinc",
+                "-include",
+                "/home/vatsal/WSL2-Linux-Kernel/include/linux/kconfig.h",
+                "-include",
+                "/home/vatsal/WSL2-Linux-Kernel/include/linux/compiler_types.h"
+            ],
+        }
+    ],
+    "version": 4
+}
