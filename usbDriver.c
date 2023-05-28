@@ -1,10 +1,10 @@
 /**
- * \file openFC-CM4-USB-Driver.c
+ * \file picoSensActuHAT_Driver.c
  * \author Vatsal Joshi
- * \date 01 May 2023
+ * \date 28 May 2023
  * \version 0.1
- * \brief A driver to read sensor data and send commands to
- * an rp2040 based PI CM4 board which is used as flight controller
+ * \brief A driver to receive sensor data and send actuator commands to
+ * an rp2040 based PI CM4 carrier board which is used as flight controller
  * and the PI CM4 is used as the main processing unit.
  */
 #include "picoSensActuHAT.h"
@@ -12,95 +12,52 @@
 // Module Information
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Vatsal Joshi");
-MODULE_DESCRIPTION("A simple Hello world LKM!");
+MODULE_DESCRIPTION("Driver for picoSensActuHAT.");
 MODULE_VERSION("0.1");
 
+///////////////////////////////////
+// Globals for char devices fops //
+///////////////////////////////////
 /**
- * \brief Variables to hold device configuration info
-*/
-size_t numSens = 0;			// Number of sensors available onboard
-size_t numActu = 0;			// Number of actuators available onboard
-data_cfg_t sensorList[128]; // Configuration for each sensor available
-data_cfg_t actuatList[128]; // Configuration for each actuator available
-
-/**
- * \brief Variables to hold IMU character device data
-*/
-#define IMU_DRIVER_NAME "picoIMU"
-#define IMU_DRIVER_CLASS "picoSensor"
-static dev_t imuDevNum;
-static struct class *imuDevClass;
-static struct cdev imuDev;
+ * \brief Variables to hold character devices info. There will be four char
+ * devices, 1. sensCnfg, 2. ActuCnfg, 3. sensData and 4. actuData. The 'sensCnfg'
+ * device will contain the info received through control transfers for NSENS and
+ * SENS_INFO vendor requests. Similarly, 'actuCnfg' device will contain the info
+ * received through control transfers for NACTU and ACTU_INFO vendor requests.
+ */
+#define DEV_CLASS_NAME "sensActuHAT"
+#define DEV_REGION_NAME "picoSensActu"
+static dev_t hatDevNum, sensCnfgDevNum, sensDataDevNum, actuCnfgDevNum, actuDataDevNum;
+static struct class *sensActuClass;
+static struct cdev sensCnfg;
+static struct cdev sensData;
+static struct cdev actuCnfg;
+static struct cdev actuData;
 u8 buf[21];
 
 /**
- * \brief This function is called when the char device file for IMU is opened.
- * \param[in] devFile Pointer to the inode for the device file.
- * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ * \brief These are buffers for the four device files that will be created.
 */
-static int imu_open(struct inode *devFile, struct file *devInstance)
+static struct {
+	uint8_t numSens;		  // Number of sensors available onboard
+	data_cfg_t sensList[128]; // Configuration for each sensor available
+} __attribute__((packed)) sensCnfgBuf;
+static struct
 {
-	printk("imuDev: File open was called.\n");
-	return 0;
-}
+	uint8_t numActu;		  // Number of actuators available onboard
+	data_cfg_t actuList[128]; // Configuration for each actuator available
+} __attribute__((packed)) actuCnfgBuf;
+static uint8_t sensDataBuf[1024];	 // Buffer to hold sensor data
+static uint8_t actuDataBuf[1024];	 // Buffer to hold actuator data
+static uint16_t sensDataOffset[128]; // Offset for the sensor data in sensDataBuf
+static uint16_t actuDataOffset[128]; // Offset for the actuator data in actuDataBuf
 
-/**
- * \brief Called when user tries to read from the device file.
-*/
-static ssize_t imu_read(struct file *imuFile, char *userBuffer, size_t bufSize, loff_t *offset)
-{
-	size_t i;
-	// toCopy: Amount of data to be copied.
-	// notCopied: Amount of data that was not coped.
-	int toCopy, notCopied;
 
-	// Copy all the data to a temp buffer
-	uint8_t outBuf[64];
-	uint8_t *bufAdd = outBuf;
-	strcpy(bufAdd, "picoSensActuHAT"); // WHOAMI
-	bufAdd += 16;
-	*bufAdd = numSens;	// NSENS
-	++bufAdd;
-	*bufAdd = 0;	// NACTU
-	++bufAdd;
-	for (i = 0; i < min(numSens,(size_t)5); ++i)	// sensorList
-	{
-		memcpy(bufAdd, &sensorList[i], sizeof(data_cfg_t));
-		bufAdd += sizeof(data_cfg_t);
-	}
-	memcpy(bufAdd, buf, 21);
 
-	// Decide how much data should be copied
-	toCopy = min(sizeof(outBuf), bufSize); // For now, we know that there will be 21 bytes of data coming from the sensor acquisition system
 
-	// Copy data to the user buffer
-	notCopied = copy_to_user(userBuffer, outBuf, toCopy);
-
-	// Calculate the number of bytes that were copied
-	return (toCopy - notCopied);
-}
-
-/**
- * \brief This function is called when the char device file for IMU is closed.
- * \param[in] devFile Pointer to the inode for the device file.
- * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
- */
-static int imu_close(struct inode *devFile, struct file *devInstance)
-{
-	printk("imuDev: File close was called.\n");
-	return 0;
-}
-
-/**
- * \brief Structure to hold file operations information for IMU data.
-*/
-const struct file_operations imu_fops = {
-	.owner = THIS_MODULE,
-	.open = imu_open,
-	.read = imu_read,
-	.release = imu_close,
-};
-
+//////////////////////////////
+// Globals for USB host API //
+//////////////////////////////
 // USB device info from the firmware
 #define VENDOR_ID 0x0000  // Vendor ID set in the Firmware
 #define PRODUCT_ID 0x0001 // Product ID set in the Firmware
@@ -113,6 +70,9 @@ static struct usb_device_id device_id_table[] = {
 	{},
 };
 
+// Make the device available to the user-space
+MODULE_DEVICE_TABLE(usb, device_id_table);
+
 /**
  * \brief Global variables to store usb device information
  */
@@ -120,9 +80,269 @@ struct urb *urb[2];
 struct usb_endpoint_descriptor ep;
 struct usb_device *udev;
 
-// Make the device available to the user-space
-MODULE_DEVICE_TABLE(usb, device_id_table);
+/**
+ * \brief These arrays hold the raw data received/sent through USB Iso transfers.
+*/
+uint8_t usbRecBuf[1023];
+uint8_t usbSndBuf[1023];
 
+
+
+
+////////////////////////////////////
+// sensCnfg Char device functions //
+////////////////////////////////////
+/**
+ * \brief This function is called when the char device file for IMU is opened.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+*/
+static int sensCnfg_open(struct inode *devFile, struct file *devInstance)
+{
+	printk("sensCnfg: File open was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Called when user tries to read from the device file.
+*/
+static ssize_t sensCnfg_read(struct file *devFile, char __user *userBuffer, size_t bufSize, loff_t *offset)
+{
+	// toCopy: Amount of data to be copied.
+	// notCopied: Amount of data that was not coped.
+	int toCopy, notCopied;
+
+	// Decide how much data should be copied
+	toCopy = min(sizeof(sensCnfgBuf) - *offset, (unsigned long long)bufSize);
+	if (toCopy <= 0)
+		return 0;
+
+	// Copy data to the user buffer
+	notCopied = copy_to_user(userBuffer, &sensCnfgBuf + *offset, toCopy);
+	if (notCopied <= 0)
+		return -EFAULT;
+
+	// Calculate the number of bytes that were copied
+	*offset += toCopy - notCopied;
+	return (toCopy - notCopied);
+}
+
+/**
+ * \brief This function is called when the char device file for IMU is closed.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int sensCnfg_close(struct inode *devFile, struct file *devInstance)
+{
+	printk("sensCnfg: File close was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Structure to hold file operations information for sensCnfg.
+ */
+const struct file_operations sensCnfg_fops = {
+	.owner = THIS_MODULE,
+	.open = sensCnfg_open,
+	.read = sensCnfg_read,
+	.release = sensCnfg_close,
+};
+
+
+
+
+////////////////////////////////////
+// sensData Char device functions //
+////////////////////////////////////
+/**
+ * \brief This function is called when the char device file for IMU is opened.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int sensData_open(struct inode *devFile, struct file *devInstance)
+{
+	printk("sensData: File open was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Called when user tries to read from the device file.
+ */
+static ssize_t sensData_read(struct file *devFile, char __user *userBuffer, size_t bufSize, loff_t *offset)
+{
+	// toCopy: Amount of data to be copied.
+	// notCopied: Amount of data that was not coped.
+	int toCopy, notCopied;
+
+	// Decide how much data should be copied
+	toCopy = min(sizeof(sensDataBuf) - *offset, (unsigned long long)bufSize);
+	if (toCopy <= 0)
+		return 0;
+
+	// Copy data to the user buffer
+	notCopied = copy_to_user(userBuffer, &sensDataBuf + *offset, toCopy);
+	if (notCopied <= 0)
+		return -EFAULT;
+
+	// Calculate the number of bytes that were copied
+	*offset += toCopy - notCopied;
+	return (toCopy - notCopied);
+}
+
+/**
+ * \brief This function is called when the char device file for IMU is closed.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int sensData_close(struct inode *devFile, struct file *devInstance)
+{
+	printk("sensData: File close was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Structure to hold file operations information for sensData.
+ */
+const struct file_operations sensData_fops = {
+	.owner = THIS_MODULE,
+	.open = sensData_open,
+	.read = sensData_read,
+	.release = sensData_close,
+};
+
+
+
+
+
+////////////////////////////////////
+// actuCnfg Char device functions //
+////////////////////////////////////
+/**
+ * \brief This function is called when the char device file for IMU is opened.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int actuCnfg_open(struct inode *devFile, struct file *devInstance)
+{
+	printk("actuCnfg: File open was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Called when user tries to read from the device file.
+ */
+static ssize_t actuCnfg_read(struct file *devFile, char __user *userBuffer, size_t bufSize, loff_t *offset)
+{
+	// toCopy: Amount of data to be copied.
+	// notCopied: Amount of data that was not coped.
+	int toCopy, notCopied;
+
+	// Decide how much data should be copied
+	toCopy = min(sizeof(actuCnfgBuf) - *offset, (unsigned long long)bufSize);
+	if (toCopy <= 0)
+		return 0;
+
+	// Copy data to the user buffer
+	notCopied = copy_to_user(userBuffer, &actuCnfgBuf + *offset, toCopy);
+	if (notCopied <= 0)
+		return -EFAULT;
+
+	// Calculate the number of bytes that were copied
+	*offset += toCopy - notCopied;
+	return (toCopy - notCopied);
+}
+
+/**
+ * \brief This function is called when the char device file for IMU is closed.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int actuCnfg_close(struct inode *devFile, struct file *devInstance)
+{
+	printk("actuCnfg: File close was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Structure to hold file operations information for actuCnfg.
+ */
+const struct file_operations actuCnfg_fops = {
+	.owner = THIS_MODULE,
+	.open = actuCnfg_open,
+	.read = actuCnfg_read,
+	.release = actuCnfg_close,
+};
+
+
+
+
+
+
+////////////////////////////////////
+// actuData Char device functions //
+////////////////////////////////////
+/**
+ * \brief This function is called when the char device file for IMU is opened.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int actuData_open(struct inode *devFile, struct file *devInstance)
+{
+	printk("actuData: File open was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Called when user tries to read from the device file.
+ */
+static ssize_t actuData_write(struct file *devFile, const char __user *userBuffer, size_t bufSize, loff_t *offset)
+{
+	// toCopy: Amount of data to be copied.
+	// notCopied: Amount of data that was not coped.
+	int toCopy, notCopied;
+
+	// Decide how much data should be copied
+	toCopy = min(sizeof(actuDataBuf) - *offset, (unsigned long long)bufSize);
+	if (toCopy <= 0)
+		return 0;
+
+	// Copy data to the user buffer
+	notCopied = copy_from_user(&actuDataBuf + *offset, userBuffer, toCopy);
+	if (notCopied <= 0)
+		return -EFAULT;
+
+	// Calculate the number of bytes that were copied
+	*offset += toCopy - notCopied;
+	return (toCopy - notCopied);
+}
+
+/**
+ * \brief This function is called when the char device file for IMU is closed.
+ * \param[in] devFile Pointer to the inode for the device file.
+ * \param[in] devInstance Pointer to the file instance of the inode described by devFile.
+ */
+static int actuData_close(struct inode *devFile, struct file *devInstance)
+{
+	printk("actuData: File close was called.\n");
+	return 0;
+}
+
+/**
+ * \brief Structure to hold file operations information for actuData.
+ */
+const struct file_operations actuData_fops = {
+	.owner = THIS_MODULE,
+	.open = actuData_open,
+	.write = actuData_write,
+	.release = actuData_close,
+};
+
+
+
+
+////////////////////////////
+// USB Host API functions //
+////////////////////////////
 void urb_complete_function(struct urb *urb)
 {
 	int err;
@@ -171,7 +391,7 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 	}
 	else if (ctrlTrnsfStatus < 0)
 	{
-		printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function 1, %d.\n", ctrlTrnsfStatus);
+		printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function, %d.\n", ctrlTrnsfStatus);
 		return -1;
 	}
 	else if (strcmp(whoAmI, "picoSensActuHAT"))
@@ -180,7 +400,7 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 		return -1;
 	}
 	// Get NSENS. This value indicates the number of sensors available onboard. Max 128 is allowed.
-	ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_NSENS, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0, (void *)&numSens, 1, 1000);
+	ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_NSENS, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0, (void *)&sensCnfgBuf.numSens, 1, 1000);
 	if (ctrlTrnsfStatus == 0)
 	{
 		printk(KERN_ERR "picoSensActuHAT: Device doesn't support NSENS request.\n");
@@ -188,13 +408,13 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 	}
 	else if (ctrlTrnsfStatus < 0)
 	{
-		printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function 2, %d.\n", ctrlTrnsfStatus);
+		printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function, %d.\n", ctrlTrnsfStatus);
 		return -1;
 	}
 	// Get info for all the sensors.
-	for (i = 0; i < numSens; ++i)
+	for (i = 0; i < sensCnfgBuf.numSens; ++i)
 	{
-		ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_SENS_INFO, USB_TYPE_VENDOR | USB_DIR_IN, 0, i, (void *)&sensorList[i], sizeof(data_cfg_t), 1000);
+		ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_SENS_INFO, USB_TYPE_VENDOR | USB_DIR_IN, 0, i, (void *)&sensCnfgBuf.sensList[i], sizeof(data_cfg_t), 1000);
 		if (ctrlTrnsfStatus == 0)
 		{
 			printk(KERN_ERR "picoSensActuHAT: Error retrieving info for sensor number %lu. Possible error in the firmware.\n", i+1);
@@ -202,10 +422,41 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 		}
 		else if (ctrlTrnsfStatus < 0)
 		{
-			printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function 3, %d.\n", ctrlTrnsfStatus);
+			printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function, %d.\n", ctrlTrnsfStatus);
 			return -1;
 		}
+		if (i)
+			sensDataOffset[i] = sensDataOffset[i - 1] + sensCnfgBuf.sensList[i - 1].nDataVal * (sensCnfgBuf.sensList[i - 1].dataType & DTYPE_WIDTH_MASK);
 	}
+	// // Get NACTU. This value indicates the number of sensors available onboard. Max 128 is allowed.
+	// ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_NACTU, USB_TYPE_VENDOR | USB_DIR_IN, 0, 0, (void *)&numActu, 1, 1000);
+	// if (ctrlTrnsfStatus == 0)
+	// {
+	// 	printk(KERN_ERR "picoSensActuHAT: Device doesn't support NACTU request.\n");
+	// 	return -1;
+	// }
+	// else if (ctrlTrnsfStatus < 0)
+	// {
+	// 	printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function, %d.\n", ctrlTrnsfStatus);
+	// 	return -1;
+	// }
+	// // Get info for all the actuators.
+	// for (i = 0; i < numActu; ++i)
+	// {
+	// 	ctrlTrnsfStatus = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0), USB_VEND_REQ_ACTU_INFO, USB_TYPE_VENDOR | USB_DIR_IN, 0, i, (void *)&sensorList[i], sizeof(data_cfg_t), 1000);
+	// 	if (ctrlTrnsfStatus == 0)
+	// 	{
+	// 		printk(KERN_ERR "picoSensActuHAT: Error retrieving info for sensor number %lu. Possible error in the firmware.\n", i + 1);
+	// 		return -1;
+	// 	}
+	// 	else if (ctrlTrnsfStatus < 0)
+	// 	{
+	// 		printk(KERN_ERR "picoSensActuHAT: Error in a control transfer from probe() function, %d.\n", ctrlTrnsfStatus);
+	// 		return -1;
+	// 	}
+	// if (i)
+	// 	actuDataOffset[i] = actuDataOffset[i - 1] + actuorList[i - 1].nDataVal * (actuorList[i - 1].dataType & DTYPE_WIDTH_MASK);
+	// }
 
 	// Device file can be created, now that we have all the necessary info.
 
@@ -242,46 +493,80 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 
 	err2 = usb_submit_urb(urb[1], GFP_KERNEL);
 
-	// If urb is submitted successfully, then initialize the IMU char device
+	// If urb is submitted successfully, then initialize the char devices
 	if (!err1 && !err2)
 	{
-		// Allocate device number
-		if (alloc_chrdev_region(&imuDevNum, 0, 1, IMU_DRIVER_NAME))
+		// Create sensCnfg device
+		if (IS_ERR_VALUE(device_create(sensActuClass, NULL, sensCnfgDevNum, NULL, "sensActuHAT!sensCnfg")))
 		{
-			printk(KERN_INFO "picoSensActuHAT: Could not allocate char device region.\n");
-			return -1;
+			printk(KERN_INFO "picoSensActuHAT: Could not create sensCnfg device file.\n");
+			goto sensCnfgDevCreateErr;
 		}
-		printk(KERN_INFO "picoSensActuHAT: CHAR device Major: %d, Minor: %d.\n", MAJOR(imuDevNum), MINOR(imuDevNum));
-
-		// Create device class
-		if ((imuDevClass = class_create(THIS_MODULE, IMU_DRIVER_CLASS)) == NULL)
+		cdev_init(&sensCnfg, &sensCnfg_fops);
+		if (cdev_add(&sensCnfg, sensCnfgDevNum, 1) < 0)
 		{
-			printk(KERN_INFO "picoSensActuHAT: Could not create device class.\n");
-			unregister_chrdev(MAJOR(imuDevNum), IMU_DRIVER_NAME);
-			return -1;
+			printk(KERN_INFO "picoSensActuHAT: Could not register sensCnfg device with the kernel.\n");
+			goto sensCnfgDevAddErr;
 		}
 
-		// Create device file
-		if (device_create(imuDevClass, NULL, imuDevNum, NULL, IMU_DRIVER_NAME) == NULL)
+		// Create sensData device
+		if (IS_ERR_VALUE(device_create(sensActuClass, NULL, sensDataDevNum, NULL, "sensActuHAT!sensData")))
 		{
-			printk(KERN_INFO "picoSensActuHAT: Could not create device file.\n");
-			class_destroy(imuDevClass);
-			unregister_chrdev(MAJOR(imuDevNum), IMU_DRIVER_NAME);
-			return -1;
+			printk(KERN_INFO "picoSensActuHAT: Could not create sensData device file.\n");
+			goto sensDataDevCreateErr;
+		}
+		cdev_init(&sensData, &sensData_fops);
+		if (cdev_add(&sensData, sensDataDevNum, 1) < 0)
+		{
+			printk(KERN_INFO "picoSensActuHAT: Could not register sensData device with the kernel.\n");
+			goto sensDataDevAddErr;
 		}
 
-		// Initialize device file
-		cdev_init(&imuDev, &imu_fops);
-
-		// Register the device with the kernel
-		if (cdev_add(&imuDev, imuDevNum, 1) < 0)
+		// Create actuCnfg device
+		if (IS_ERR_VALUE(device_create(sensActuClass, NULL, actuCnfgDevNum, NULL, "sensActuHAT!actuCnfg")))
 		{
-			printk(KERN_INFO "picoSensActuHAT: Could not register device with the kernel.\n");
-			device_destroy(imuDevClass, imuDevNum);
-			class_destroy(imuDevClass);
-			unregister_chrdev(MAJOR(imuDevNum), IMU_DRIVER_NAME);
-			return -1;
+			printk(KERN_INFO "picoSensActuHAT: Could not create actuCnfg device file.\n");
+			goto actuCnfgDevCreateErr;
 		}
+		cdev_init(&actuCnfg, &actuCnfg_fops);
+		if (cdev_add(&actuCnfg, actuCnfgDevNum, 1) < 0)
+		{
+			printk(KERN_INFO "picoSensActuHAT: Could not register actuCnfg device with the kernel.\n");
+			goto actuCnfgDevAddErr;
+		}
+
+		// Create actuData device
+		if (IS_ERR_VALUE(device_create(sensActuClass, NULL, actuDataDevNum, NULL, "sensActuHAT!actuData")))
+		{
+			printk(KERN_INFO "picoSensActuHAT: Could not create actuData device file.\n");
+			goto actuDataDevCreateErr;
+		}
+		cdev_init(&actuData, &actuData_fops);
+		if (cdev_add(&actuData, actuDataDevNum, 1) < 0)
+		{
+			printk(KERN_INFO "picoSensActuHAT: Could not register actuData device with the kernel.\n");
+			goto actuDataDevAddErr;
+		}
+
+		goto devFilesSuccess;
+
+	actuDataDevAddErr:
+		device_destroy(sensActuClass, actuDataDevNum);
+	actuDataDevCreateErr:
+		cdev_del(&actuCnfg);
+	actuCnfgDevAddErr:
+		device_destroy(sensActuClass, actuCnfgDevNum);
+	actuCnfgDevCreateErr:
+		cdev_del(&sensData);
+	sensDataDevAddErr:
+		device_destroy(sensActuClass, sensDataDevNum);
+	sensDataDevCreateErr:
+		cdev_del(&sensCnfg);
+	sensCnfgDevAddErr:
+		device_destroy(sensActuClass, sensCnfgDevNum);
+	sensCnfgDevCreateErr:
+		return -1;
+	devFilesSuccess:
 	}
 	else
 	{
@@ -299,38 +584,74 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 static void disconnect_function(struct usb_interface *intrfc)
 {
 	printk(KERN_INFO "picoSensActuHAT: Raspberry Pi Pico Sensor Acquisition Device was detached.\n");
-	cdev_del(&imuDev);
-	device_destroy(imuDevClass, imuDevNum);
-	class_destroy(imuDevClass);
-	unregister_chrdev(MAJOR(imuDevNum), IMU_DRIVER_NAME);
+	cdev_del(&actuData);
+	device_destroy(sensActuClass, actuDataDevNum);
+	cdev_del(&actuCnfg);
+	device_destroy(sensActuClass, actuCnfgDevNum);
+	cdev_del(&sensData);
+	device_destroy(sensActuClass, sensDataDevNum);
+	cdev_del(&sensCnfg);
+	device_destroy(sensActuClass, sensCnfgDevNum);
 }
 
 /**
  * \brief Instance of this USB device driver that will be provided to USB subsystem.
-*/
+ */
 static struct usb_driver picoSensActuHATDriver = {
-	.name = "Pico Sensor Acquisition Device Driver",
+	.name = "Pico Sensor Actuator HAT Driver",
 	.id_table = device_id_table,
 	.probe = probe_function,
 	.disconnect = disconnect_function,
 };
 
+
+
+
+
+///////////////////////////////////
+// Linux Kernel Module Functions //
+///////////////////////////////////
 static int __init picoSensActuHAT_init(void)
 {
 	int ret;
 	printk(KERN_INFO "picoSensActuHAT: Module Initialization.\n");
+
 	ret = usb_register(&picoSensActuHATDriver);
 	if (ret)
 	{
-		printk(KERN_ERR "picoSensActuHAT: Error registering the driver.\n");
+		printk(KERN_ERR "picoSensActuHAT: Error registering the usb driver.\n");
 		return -ret;
 	}
+
+	// Allocate char device region, provides device major number
+	if (alloc_chrdev_region(&hatDevNum, 0, 1, DEV_REGION_NAME))
+	{
+		printk(KERN_INFO "picoSensActuHAT: Could not allocate char device region.\n");
+		return -1;
+	}
+
+	// Create device class
+	if ((sensActuClass = class_create(THIS_MODULE, DEV_CLASS_NAME)) == NULL)
+	{
+		printk(KERN_INFO "picoSensActuHAT: Could not create device class.\n");
+		unregister_chrdev_region(hatDevNum, 1);
+		return -1;
+	}
+
+	// Define device numbers for char devices
+	sensCnfgDevNum = MKDEV(MAJOR(hatDevNum), 0);
+	sensDataDevNum = MKDEV(MAJOR(hatDevNum), 1);
+	actuCnfgDevNum = MKDEV(MAJOR(hatDevNum), 2);
+	actuDataDevNum = MKDEV(MAJOR(hatDevNum), 3);
+
 	return 0;
 }
 
 static void __exit picoSensActuHAT_exit(void)
 {
 	printk(KERN_INFO "picoSensActuHAT: Module Deinitialization.\n");
+	class_destroy(sensActuClass);
+	unregister_chrdev_region(hatDevNum, 1);
 	usb_deregister(&picoSensActuHATDriver);
 }
 
