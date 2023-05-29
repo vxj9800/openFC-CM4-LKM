@@ -98,7 +98,6 @@ uint8_t usbSndBuf[1023];
 */
 static int sensCnfg_open(struct inode *devFile, struct file *devInstance)
 {
-	printk("sensCnfg: File open was called.\n");
 	return 0;
 }
 
@@ -110,8 +109,6 @@ static ssize_t sensCnfg_read(struct file *devFile, char __user *userBuffer, size
 	// toCopy: Amount of data to be copied.
 	// notCopied: Amount of data that was not coped.
 	int toCopy, notCopied;
-
-	printk(KERN_INFO "sensCnfg: offset = %lld", *offset);
 
 	// Decide how much data should be copied
 	toCopy = min((size_t)(sizeof(sensCnfgBuf) - *offset), bufSize);
@@ -133,7 +130,6 @@ static ssize_t sensCnfg_read(struct file *devFile, char __user *userBuffer, size
  */
 static int sensCnfg_close(struct inode *devFile, struct file *devInstance)
 {
-	printk("sensCnfg: File close was called.\n");
 	return 0;
 }
 
@@ -160,7 +156,6 @@ const struct file_operations sensCnfg_fops = {
  */
 static int sensData_open(struct inode *devFile, struct file *devInstance)
 {
-	printk("sensData: File open was called.\n");
 	return 0;
 }
 
@@ -193,7 +188,6 @@ static ssize_t sensData_read(struct file *devFile, char __user *userBuffer, size
  */
 static int sensData_close(struct inode *devFile, struct file *devInstance)
 {
-	printk("sensData: File close was called.\n");
 	return 0;
 }
 
@@ -221,7 +215,6 @@ const struct file_operations sensData_fops = {
  */
 static int actuCnfg_open(struct inode *devFile, struct file *devInstance)
 {
-	printk("actuCnfg: File open was called.\n");
 	return 0;
 }
 
@@ -254,7 +247,6 @@ static ssize_t actuCnfg_read(struct file *devFile, char __user *userBuffer, size
  */
 static int actuCnfg_close(struct inode *devFile, struct file *devInstance)
 {
-	printk("actuCnfg: File close was called.\n");
 	return 0;
 }
 
@@ -283,7 +275,6 @@ const struct file_operations actuCnfg_fops = {
  */
 static int actuData_open(struct inode *devFile, struct file *devInstance)
 {
-	printk("actuData: File open was called.\n");
 	return 0;
 }
 
@@ -316,7 +307,6 @@ static ssize_t actuData_write(struct file *devFile, const char __user *userBuffe
  */
 static int actuData_close(struct inode *devFile, struct file *devInstance)
 {
-	printk("actuData: File close was called.\n");
 	return 0;
 }
 
@@ -339,7 +329,7 @@ const struct file_operations actuData_fops = {
 void rcvUrbCompleteFunc(struct urb *urb)
 {
 	int err, i, len;
-	uint8_t *bufOffset = usbRcvBuf;
+	uint8_t *bufOffset = usbRcvBuf + 1;
 
 	// Check the status of URB
 	if (urb->status || urb->iso_frame_desc[0].status)
