@@ -33,7 +33,6 @@ static struct cdev sensCnfg;
 static struct cdev sensData;
 static struct cdev actuCnfg;
 static struct cdev actuData;
-u8 buf[21];
 
 /**
  * \brief These are buffers for the four device files that will be created.
@@ -76,14 +75,14 @@ MODULE_DEVICE_TABLE(usb, device_id_table);
 /**
  * \brief Global variables to store usb device information
  */
-struct urb *urb[2];
-struct usb_endpoint_descriptor ep;
+struct urb *rcvUrb[2], *sndUrb[2];
+struct usb_endpoint_descriptor epIn, epOut;
 struct usb_device *udev;
 
 /**
  * \brief These arrays hold the raw data received/sent through USB Iso transfers.
 */
-uint8_t usbRecBuf[1023];
+uint8_t usbRcvBuf[1023];
 uint8_t usbSndBuf[1023];
 
 
@@ -112,15 +111,15 @@ static ssize_t sensCnfg_read(struct file *devFile, char __user *userBuffer, size
 	// notCopied: Amount of data that was not coped.
 	int toCopy, notCopied;
 
+	printk(KERN_INFO "sensCnfg: offset = %lld", *offset);
+
 	// Decide how much data should be copied
-	toCopy = min(sizeof(sensCnfgBuf) - *offset, (unsigned long long)bufSize);
+	toCopy = min((size_t)(sizeof(sensCnfgBuf) - *offset), bufSize);
 	if (toCopy <= 0)
 		return 0;
 
 	// Copy data to the user buffer
 	notCopied = copy_to_user(userBuffer, &sensCnfgBuf + *offset, toCopy);
-	if (notCopied <= 0)
-		return -EFAULT;
 
 	// Calculate the number of bytes that were copied
 	*offset += toCopy - notCopied;
@@ -175,14 +174,12 @@ static ssize_t sensData_read(struct file *devFile, char __user *userBuffer, size
 	int toCopy, notCopied;
 
 	// Decide how much data should be copied
-	toCopy = min(sizeof(sensDataBuf) - *offset, (unsigned long long)bufSize);
+	toCopy = min((size_t)(sizeof(sensDataBuf) - *offset), bufSize);
 	if (toCopy <= 0)
 		return 0;
 
 	// Copy data to the user buffer
 	notCopied = copy_to_user(userBuffer, &sensDataBuf + *offset, toCopy);
-	if (notCopied <= 0)
-		return -EFAULT;
 
 	// Calculate the number of bytes that were copied
 	*offset += toCopy - notCopied;
@@ -238,14 +235,12 @@ static ssize_t actuCnfg_read(struct file *devFile, char __user *userBuffer, size
 	int toCopy, notCopied;
 
 	// Decide how much data should be copied
-	toCopy = min(sizeof(actuCnfgBuf) - *offset, (unsigned long long)bufSize);
+	toCopy = min((size_t)(sizeof(actuCnfgBuf) - *offset), bufSize);
 	if (toCopy <= 0)
 		return 0;
 
 	// Copy data to the user buffer
 	notCopied = copy_to_user(userBuffer, &actuCnfgBuf + *offset, toCopy);
-	if (notCopied <= 0)
-		return -EFAULT;
 
 	// Calculate the number of bytes that were copied
 	*offset += toCopy - notCopied;
@@ -302,14 +297,12 @@ static ssize_t actuData_write(struct file *devFile, const char __user *userBuffe
 	int toCopy, notCopied;
 
 	// Decide how much data should be copied
-	toCopy = min(sizeof(actuDataBuf) - *offset, (unsigned long long)bufSize);
+	toCopy = min((size_t)(sizeof(actuDataBuf) - *offset), bufSize);
 	if (toCopy <= 0)
 		return 0;
 
 	// Copy data to the user buffer
 	notCopied = copy_from_user(&actuDataBuf + *offset, userBuffer, toCopy);
-	if (notCopied <= 0)
-		return -EFAULT;
 
 	// Calculate the number of bytes that were copied
 	*offset += toCopy - notCopied;
@@ -343,9 +336,10 @@ const struct file_operations actuData_fops = {
 ////////////////////////////
 // USB Host API functions //
 ////////////////////////////
-void urb_complete_function(struct urb *urb)
+void rcvUrbCompleteFunc(struct urb *urb)
 {
-	int err;
+	int err, i, len;
+	uint8_t *bufOffset = usbRcvBuf;
 
 	// Check the status of URB
 	if (urb->status || urb->iso_frame_desc[0].status)
@@ -360,6 +354,17 @@ void urb_complete_function(struct urb *urb)
 	err = usb_submit_urb(urb, GFP_KERNEL);
 	if (err)
 		printk(KERN_INFO "picoSensActuHAT: Error submitting urb from completion function.\n");
+
+	// Transfer data to file buffer
+	for (i = 0; i < sensCnfgBuf.numSens; ++i)
+	{
+		if (*(usbRcvBuf + i / 8) & (1 << (i % 8)))
+		{
+			len = sensCnfgBuf.sensList[i].nDataVal * (sensCnfgBuf.sensList[i].dataType & DTYPE_WIDTH_MASK);
+			memcpy(sensDataBuf + sensDataOffset[i], bufOffset, len);
+			bufOffset += len;
+		}
+	}
 }
 
 /**
@@ -462,36 +467,36 @@ static int probe_function(struct usb_interface *intrfc, const struct usb_device_
 
 	printk(KERN_INFO "picoSensActuHAT: Raspberry Pi Pico Sensor Acquisition Device was attached.\n");
 
-	ep = intrfc->cur_altsetting->endpoint[0].desc;
+	epIn = intrfc->cur_altsetting->endpoint[0].desc;
 
 	// Sumbit two urbs so that they are double buffered.
-	urb[0] = usb_alloc_urb(1,GFP_KERNEL);
-	urb[0]->dev = udev;
-	urb[0]->pipe = usb_rcvisocpipe(udev, ep.bEndpointAddress);
-	urb[0]->interval = 1;
-	urb[0]->transfer_flags = URB_ISO_ASAP;
-	urb[0]->transfer_buffer = buf;
-	urb[0]->transfer_buffer_length = 21;
-	urb[0]->complete = urb_complete_function;
-	urb[0]->number_of_packets = 1;
-	urb[0]->iso_frame_desc[0].offset = 0;
-	urb[0]->iso_frame_desc[0].length = 21;
+	rcvUrb[0] = usb_alloc_urb(1,GFP_KERNEL);
+	rcvUrb[0]->dev = udev;
+	rcvUrb[0]->pipe = usb_rcvisocpipe(udev, epIn.bEndpointAddress);
+	rcvUrb[0]->interval = epIn.bInterval;
+	rcvUrb[0]->transfer_flags = URB_ISO_ASAP;
+	rcvUrb[0]->transfer_buffer = usbRcvBuf;
+	rcvUrb[0]->transfer_buffer_length = epIn.wMaxPacketSize;
+	rcvUrb[0]->complete = rcvUrbCompleteFunc;
+	rcvUrb[0]->number_of_packets = 1;
+	rcvUrb[0]->iso_frame_desc[0].offset = 0;
+	rcvUrb[0]->iso_frame_desc[0].length = epIn.wMaxPacketSize;
 
-	err1 = usb_submit_urb(urb[0], GFP_KERNEL);
+	err1 = usb_submit_urb(rcvUrb[0], GFP_KERNEL);
 
-	urb[1] = usb_alloc_urb(1, GFP_KERNEL);
-	urb[1]->dev = udev;
-	urb[1]->pipe = usb_rcvisocpipe(udev, ep.bEndpointAddress);
-	urb[1]->interval = 1;
-	urb[1]->transfer_flags = URB_ISO_ASAP;
-	urb[1]->transfer_buffer = buf;
-	urb[1]->transfer_buffer_length = 21;
-	urb[1]->complete = urb_complete_function;
-	urb[1]->number_of_packets = 1;
-	urb[1]->iso_frame_desc[0].offset = 0;
-	urb[1]->iso_frame_desc[0].length = 21;
+	rcvUrb[1] = usb_alloc_urb(1, GFP_KERNEL);
+	rcvUrb[1]->dev = udev;
+	rcvUrb[1]->pipe = usb_rcvisocpipe(udev, epIn.bEndpointAddress);
+	rcvUrb[1]->interval = epIn.bInterval;
+	rcvUrb[1]->transfer_flags = URB_ISO_ASAP;
+	rcvUrb[1]->transfer_buffer = usbRcvBuf;
+	rcvUrb[1]->transfer_buffer_length = epIn.wMaxPacketSize;
+	rcvUrb[1]->complete = rcvUrbCompleteFunc;
+	rcvUrb[1]->number_of_packets = 1;
+	rcvUrb[1]->iso_frame_desc[0].offset = 0;
+	rcvUrb[1]->iso_frame_desc[0].length = epIn.wMaxPacketSize;
 
-	err2 = usb_submit_urb(urb[1], GFP_KERNEL);
+	err2 = usb_submit_urb(rcvUrb[1], GFP_KERNEL);
 
 	// If urb is submitted successfully, then initialize the char devices
 	if (!err1 && !err2)
@@ -611,6 +616,12 @@ static struct usb_driver picoSensActuHATDriver = {
 ///////////////////////////////////
 // Linux Kernel Module Functions //
 ///////////////////////////////////
+static int devNodePermissions(struct device *dev, struct kobj_uevent_env *env)
+{
+	add_uevent_var(env, "DEVMODE=%#o", 0666);
+	return 0;
+}
+
 static int __init picoSensActuHAT_init(void)
 {
 	int ret;
@@ -624,19 +635,20 @@ static int __init picoSensActuHAT_init(void)
 	}
 
 	// Allocate char device region, provides device major number
-	if (alloc_chrdev_region(&hatDevNum, 0, 1, DEV_REGION_NAME))
+	if (alloc_chrdev_region(&hatDevNum, 0, 4, DEV_REGION_NAME))
 	{
 		printk(KERN_INFO "picoSensActuHAT: Could not allocate char device region.\n");
 		return -1;
 	}
 
 	// Create device class
-	if ((sensActuClass = class_create(THIS_MODULE, DEV_CLASS_NAME)) == NULL)
+	if (IS_ERR(sensActuClass = class_create(THIS_MODULE, DEV_CLASS_NAME)))
 	{
 		printk(KERN_INFO "picoSensActuHAT: Could not create device class.\n");
 		unregister_chrdev_region(hatDevNum, 1);
-		return -1;
+		return PTR_ERR(sensActuClass);
 	}
+	sensActuClass->dev_uevent = devNodePermissions;
 
 	// Define device numbers for char devices
 	sensCnfgDevNum = MKDEV(MAJOR(hatDevNum), 0);
